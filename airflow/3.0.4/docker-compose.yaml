@@ -1,0 +1,671 @@
+services:
+  # Redis - Broker para o Celery
+  redis:
+    image: 'redis:7-alpine'     
+    command: redis-server --requirepass ${SERVICE_PASSWORD_REDIS}
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${SERVICE_PASSWORD_REDIS}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    volumes:
+      - 'redis_data:/data'
+
+  postgres:
+    image: 'postgres:12-alpine'  # Corrigido para PostgreSQL 15  
+    command:
+      - postgres
+      - '-c'
+      - max_connections=1000
+      - '-c'
+      - shared_buffers=256MB
+      - '-c'
+      - effective_cache_size=1GB
+      - '-c'
+      - maintenance_work_mem=64MB
+    environment:
+      - POSTGRES_USER=${SERVICE_USER_POSTGRES}
+      - POSTGRES_PASSWORD=${SERVICE_PASSWORD_POSTGRES}
+      - POSTGRES_DB=${POSTGRES_DB:-airflow}
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'pg_isready -U ${SERVICE_USER_POSTGRES} -d ${POSTGRES_DB:-airflow} -h 127.0.0.1'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    volumes:
+      - 'postgres_data:/var/lib/postgresql/data'
+
+  # Serviço de inicialização com FAB
+  airflow-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: /bin/bash
+    user: "0:0"  # Rodar como root para configurar permissões
+    command:
+      - -c
+      - |
+        set -e
+        echo "=== Iniciando configuração do Airflow 3.0.4 com FAB Auth Manager ==="
+        echo "Versão do Airflow:"
+        airflow version
+        
+        # Criar diretórios necessários
+        echo "Criando diretórios..."
+        mkdir -p /opt/airflow /opt/airflow/dags /opt/airflow/logs /opt/airflow/plugins /opt/airflow/include /opt/airflow/config
+        
+        # Ajustar permissões para o usuário airflow (UID 50000)
+        echo "Ajustando permissões..."
+        chown -R 50000:0 /opt/airflow
+        echo "=== chown -R 50000:0 /opt/airflow ==="
+        chmod -R 775 /opt/airflow
+        echo "=== chmod -R 775 /opt/airflow ==="
+
+        # Criar script Python separado para evitar problemas de indentação
+        cat > /tmp/create_session_table.py << 'PYTHON_SCRIPT'
+        import os
+        import sys
+        from sqlalchemy import create_engine, text
+        
+        # Obter conexão do banco
+        db_url = os.environ["AIRFLOW__CORE__SQL_ALCHEMY_CONN"]
+        engine = create_engine(db_url)
+        
+        # SQL para criar a tabela de sessão
+        create_session_sql = """
+        CREATE TABLE IF NOT EXISTS session (
+            id SERIAL PRIMARY KEY,
+            session_id VARCHAR(255) UNIQUE NOT NULL,
+            data BYTEA,
+            expiry TIMESTAMP WITHOUT TIME ZONE,
+            created_on TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_session_expiry ON session(expiry);
+        CREATE INDEX IF NOT EXISTS idx_session_session_id ON session(session_id);
+        """
+        
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(create_session_sql))
+                print("Tabela de sessão criada com sucesso!")
+        except Exception as e:
+            print(f"Erro ao criar tabela de sessão: {e}")
+            if "already exists" not in str(e).lower():
+                sys.exit(1)
+        PYTHON_SCRIPT
+        
+        # Executar como usuário airflow
+        echo "Iniciando configuração do banco de dados..."
+        su airflow -c '
+          export AIRFLOW_HOME=/opt/airflow
+          
+          # Migrar o banco de dados principal do Airflow
+          echo ">>> Migrando banco de dados do Airflow..."
+          airflow db migrate
+          
+          # Migrar o banco de dados do FAB
+          echo ">>> Migrando banco de dados do FAB Auth Manager..."
+          airflow fab-db migrate || echo "FAB DB migration skipped or already done"
+          
+          # Criar a tabela de sessão
+          echo ">>> Criando tabela de sessão..."
+          python3 /tmp/create_session_table.py
+          
+          # Verificar se o banco está acessível
+          airflow db check
+          
+          # Criar usuário admin se não existir
+          echo ">>> Criando usuário admin..."
+          airflow users create \
+            --username ${SERVICE_USER_AIRFLOW} \
+            --firstname ${AIRFLOW_ADMIN_FIRSTNAME:-Admin} \
+            --lastname ${AIRFLOW_ADMIN_LASTNAME:-User} \
+            --role Admin \
+            --email ${AIRFLOW_ADMIN_EMAIL:-admin@example.com} \
+            --password ${SERVICE_PASSWORD_AIRFLOW} || echo "Usuário admin já existe"
+          
+          echo "=== Configuração concluída com sucesso! ==="
+        '
+        
+        # Limpar arquivo temporário
+        rm -f /tmp/create_session_table.py
+        
+        echo "=== Inicialização do Airflow 3.0.4 concluída! ===="
+    environment:
+      # Configurações básicas
+      - AIRFLOW_HOME=/opt/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      
+      # Banco de dados
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      
+      # FAB Auth Manager - Configuração Principal
+      - AIRFLOW__CORE__AUTH_MANAGER=airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+      
+      # Segurança
+      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY}
+      - AIRFLOW__API__SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      
+      # Executor
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__CELERY__BROKER_URL=redis://:${SERVICE_PASSWORD_REDIS}@redis:6379/0
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      
+      # API Configuration (Airflow 3.0)
+      - AIRFLOW__API__BASE_URL=${SERVICE_URL_AIRFLOW:-https://af.nexttera.net}
+      - AIRFLOW__API__HOST=0.0.0.0
+      - AIRFLOW__API__PORT=8080
+      
+      # Flask Session
+      - AIRFLOW__WEBSERVER__SESSION_TYPE=database
+      - AIRFLOW__WEBSERVER__SESSION_COOKIE_SECURE=False  # Mudar para True em produção com HTTPS
+      - AIRFLOW__WEBSERVER__SESSION_COOKIE_SAMESITE=Lax
+      - AIRFLOW__WEBSERVER__SESSION_COOKIE_HTTPONLY=True
+      
+      # Proxy Configuration (para reverse proxy)
+      - AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX=True
+      - AIRFLOW__WEBSERVER__PROXY_FIX_X_FOR=1
+      - AIRFLOW__WEBSERVER__PROXY_FIX_X_PROTO=1
+      - AIRFLOW__WEBSERVER__PROXY_FIX_X_HOST=1
+      
+      # Credenciais do admin inicial
+      - AIRFLOW_ADMIN_USERNAME=${SERVICE_USER_AIRFLOW}
+      - AIRFLOW_ADMIN_PASSWORD=${SERVICE_PASSWORD_AIRFLOW}
+      - AIRFLOW_ADMIN_EMAIL=${AIRFLOW_ADMIN_EMAIL:-admin@example.com}
+      - AIRFLOW_ADMIN_FIRSTNAME=${AIRFLOW_ADMIN_FIRSTNAME:-Admin}
+      - AIRFLOW_ADMIN_LASTNAME=${AIRFLOW_ADMIN_LASTNAME:-User}
+    volumes:
+      - './dags:/opt/airflow/dags'
+      - './logs:/opt/airflow/logs'
+      - './plugins:/opt/airflow/plugins'
+      - './include:/opt/airflow/include'
+      - 'airflow_home:/opt/airflow'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+
+  # API Server - SERVE API E INTERFACE WEB NO AIRFLOW 3.0
+  api-server:
+    build:
+      context: .
+      dockerfile: Dockerfile        
+    command: api-server
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${AIRFLOW_WEBSERVER_PORT:-8080}:8080"
+    volumes:
+      - './dags:/opt/airflow/dags'
+      - './logs:/opt/airflow/logs'
+      - './plugins:/opt/airflow/plugins'
+      - './include:/opt/airflow/include'
+      - 'airflow_home:/opt/airflow'
+    environment:
+      # Configurações básicas
+      - SERVICE_FQDN_AIRFLOW_8080=${SERVICE_FQDN_AIRFLOW_8080}
+      - AIRFLOW_HOME=/opt/airflow
+      - AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      
+      # Banco de dados
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE=10
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_MAX_OVERFLOW=20
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_RECYCLE=3600
+      
+      # FAB Auth Manager
+      - AIRFLOW__CORE__AUTH_MANAGER=airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+      
+      # Executor e Celery
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__CELERY__BROKER_URL=redis://:${SERVICE_PASSWORD_REDIS}@redis:6379/0
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      
+      # Internal API
+      - AIRFLOW__CORE__INTERNAL_API_URL=http://api-server:8080
+      - AIRFLOW__CORE__INTERNAL_API_SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      
+      # API Configuration (Airflow 3.0)
+      - AIRFLOW__API__BASE_URL=${SERVICE_URL_AIRFLOW:-https://af.nexttera.net}
+      - AIRFLOW__API__HOST=0.0.0.0
+      - AIRFLOW__API__PORT=8080
+      
+      # Flask Session
+      - AIRFLOW__WEBSERVER__SESSION_TYPE=database
+      - AIRFLOW__WEBSERVER__SESSION_BACKEND=database
+      - AIRFLOW__WEBSERVER__SESSION_COOKIE_SECURE=True
+      - AIRFLOW__WEBSERVER__SESSION_COOKIE_SAMESITE=Lax
+      - AIRFLOW__WEBSERVER__SESSION_COOKIE_HTTPONLY=True
+      
+      # Proxy Configuration
+      - AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX=True
+      - AIRFLOW__WEBSERVER__PROXY_FIX_X_FOR=1
+      - AIRFLOW__WEBSERVER__PROXY_FIX_X_PROTO=1
+      - AIRFLOW__WEBSERVER__PROXY_FIX_X_HOST=1
+      
+      # Segurança
+      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY}
+      - AIRFLOW__API__SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      - AIRFLOW__API_AUTH__JWT_SECRET=${SERVICE_PASSWORD_JWTAIRFLOW}
+      
+      # FAB Configuration
+      - AIRFLOW__FAB__AUTH_TYPE=DB
+      - AIRFLOW__FAB__AUTH_USER_REGISTRATION=False
+      - AIRFLOW__FAB__AUTH_USER_REGISTRATION_ROLE=Viewer
+      - AIRFLOW__FAB__UPDATE_FAB_PERMS=True
+      
+      # DAG Processor
+      - AIRFLOW__SCHEDULER__STANDALONE_DAG_PROCESSOR=true
+      
+      # DBT e OpenLineage
+      - DBT_EXECUTABLE_PATH=/opt/airflow/dbt_venv/bin/dbt
+      - AIRFLOW__OPENLINEAGE__NAMESPACE=airflow_dbt
+      - AIRFLOW__OPENLINEAGE__DISABLED=false
+      - AIRFLOW__OPENLINEAGE__TRANSPORT={"type":"console"}   
+      - AIRFLOW__COSMOS__EMIT_LINEAGE=true
+
+      # Airflow Code Editor Configuration
+      - AIRFLOW__CODE_EDITOR__ENABLED=True
+      - AIRFLOW__CODE_EDITOR__GIT_ENABLED=True
+      - AIRFLOW__CODE_EDITOR__GIT_CMD=/usr/bin/git
+      - AIRFLOW__CODE_EDITOR__GIT_DEFAULT_ARGS=-c color.ui=true
+      - AIRFLOW__CODE_EDITOR__GIT_AUTHOR_NAME=${GIT_AUTHOR_NAME:-Airflow Admin}
+      - AIRFLOW__CODE_EDITOR__GIT_AUTHOR_EMAIL=${GIT_AUTHOR_EMAIL:-admin@example.com}
+      - AIRFLOW__CODE_EDITOR__GIT_INIT_REPO=True  # Mudar para True se quiser inicializar repo
+      - AIRFLOW__CODE_EDITOR__ROOT_DIRECTORY=/opt/airflow/dags
+      - AIRFLOW__CODE_EDITOR__LINE_LENGTH=88
+      - AIRFLOW__CODE_EDITOR__STRING_NORMALIZATION=False
+      
+      # Mount points para projetos DBT
+      - AIRFLOW__CODE_EDITOR__MOUNT=name=dbt_projects,path=/opt/airflow/dags/dbt
+      - AIRFLOW__CODE_EDITOR__MOUNT1=name=logs,path=/opt/airflow/logs
+      - AIRFLOW__CODE_EDITOR__MOUNT2=name=include,path=/opt/airflow/include
+      - AIRFLOW__CODE_EDITOR__MOUNT3=name=plugins,path=/opt/airflow/plugins
+      
+      # Ignorar arquivos desnecessários
+      - AIRFLOW__CODE_EDITOR__IGNORED_ENTRIES=.*,__pycache__,*.pyc,target,dbt_packages,logs,.git
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - '--fail'
+        - 'http://localhost:8080/api/v2/monitor/health'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    user: "50000:0"
+    labels:
+      - "coolify.managed=true"
+      - "coolify.type=application"
+      - "coolify.http=8080"
+
+  # Scheduler
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile         
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      api-server:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Configurações básicas
+      - AIRFLOW_HOME=/opt/airflow
+      - AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      
+      # Banco de dados
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      
+      # FAB Auth Manager
+      - AIRFLOW__CORE__AUTH_MANAGER=airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+      
+      # Executor e Celery
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__CELERY__BROKER_URL=redis://:${SERVICE_PASSWORD_REDIS}@redis:6379/0
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      
+      # Internal API
+      - AIRFLOW__CORE__INTERNAL_API_URL=http://api-server:8080
+      - AIRFLOW__CORE__INTERNAL_API_SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      - AIRFLOW__CORE__EXECUTION_API_SERVER_URL=http://api-server:8080/execution/
+      
+      # Segurança
+      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY}
+      - AIRFLOW__API__SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      - AIRFLOW__API_AUTH__JWT_SECRET=${SERVICE_PASSWORD_JWTAIRFLOW}
+      
+      # Configurações do Scheduler
+      - AIRFLOW__SCHEDULER__STANDALONE_DAG_PROCESSOR=true
+      - AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL=30
+      - AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL=30
+      - AIRFLOW__SCHEDULER__PARSING_PROCESSES=2
+      
+      # DBT e OpenLineage
+      - DBT_EXECUTABLE_PATH=/opt/airflow/dbt_venv/bin/dbt
+      - AIRFLOW__OPENLINEAGE__NAMESPACE=airflow_dbt
+      - AIRFLOW__OPENLINEAGE__DISABLED=false
+      - AIRFLOW__OPENLINEAGE__TRANSPORT={"type":"console"}      
+      - AIRFLOW__COSMOS__EMIT_LINEAGE=true
+    volumes:
+      - './dags:/opt/airflow/dags'
+      - './logs:/opt/airflow/logs'
+      - './plugins:/opt/airflow/plugins'
+      - './include:/opt/airflow/include'
+      - 'airflow_home:/opt/airflow'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    user: "50000:0"
+
+  # Worker 1
+  worker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile             
+    command: celery worker
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      scheduler:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Configurações básicas
+      - AIRFLOW_HOME=/opt/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      
+      # Banco de dados
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      
+      # Executor e Celery
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__CELERY__BROKER_URL=redis://:${SERVICE_PASSWORD_REDIS}@redis:6379/0
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      
+      # Internal API
+      - AIRFLOW__CORE__INTERNAL_API_URL=http://api-server:8080
+      - AIRFLOW__CORE__INTERNAL_API_SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      - AIRFLOW__CORE__EXECUTION_API_SERVER_URL=http://api-server:8080/execution/
+      
+      # Segurança
+      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY}
+      
+      # Worker Configuration
+      - AIRFLOW__CELERY__WORKER_CONCURRENCY=4
+      - AIRFLOW__CELERY__WORKER_PREFETCH_MULTIPLIER=1
+      - AIRFLOW__CELERY__TASK_TRACK_STARTED=true
+      - AIRFLOW__CELERY__TASK_PUBLISH_MAX_RETRIES=3
+      - DUMB_INIT_SETSID=0
+      
+      # DBT
+      - DBT_EXECUTABLE_PATH=/opt/airflow/dbt_venv/bin/dbt
+    volumes:
+      - './dags:/opt/airflow/dags'
+      - './logs:/opt/airflow/logs'
+      - './plugins:/opt/airflow/plugins'
+      - './include:/opt/airflow/include'
+      - 'airflow_home:/opt/airflow'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d celery@$${HOSTNAME}'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: on-failure:5
+    user: "50000:0"
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  # Worker 2
+  worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile              
+    command: celery worker
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      scheduler:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Configurações básicas
+      - AIRFLOW_HOME=/opt/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      
+      # Banco de dados
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      
+      # Executor e Celery
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__CELERY__BROKER_URL=redis://:${SERVICE_PASSWORD_REDIS}@redis:6379/0
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      
+      # Internal API
+      - AIRFLOW__CORE__INTERNAL_API_URL=http://api-server:8080
+      - AIRFLOW__CORE__INTERNAL_API_SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      - AIRFLOW__CORE__EXECUTION_API_SERVER_URL=http://api-server:8080/execution/
+      
+      # Segurança
+      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY}
+      
+      # Worker Configuration
+      - AIRFLOW__CELERY__WORKER_CONCURRENCY=4
+      - AIRFLOW__CELERY__WORKER_PREFETCH_MULTIPLIER=1
+      - AIRFLOW__CELERY__TASK_TRACK_STARTED=true
+      - AIRFLOW__CELERY__TASK_PUBLISH_MAX_RETRIES=3
+      - DUMB_INIT_SETSID=0
+      
+      # DBT
+      - DBT_EXECUTABLE_PATH=/opt/airflow/dbt_venv/bin/dbt
+    volumes:
+      - './dags:/opt/airflow/dags'
+      - './logs:/opt/airflow/logs'
+      - './plugins:/opt/airflow/plugins'
+      - './include:/opt/airflow/include'
+      - 'airflow_home:/opt/airflow'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d celery@$${HOSTNAME}'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: on-failure:5
+    user: "50000:0"
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  # Triggerer
+  triggerer:
+    build:
+      context: .
+      dockerfile: Dockerfile             
+    command: triggerer
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      api-server:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Configurações básicas
+      - AIRFLOW_HOME=/opt/airflow
+      - AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      
+      # Banco de dados
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      
+      # FAB Auth Manager
+      - AIRFLOW__CORE__AUTH_MANAGER=airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+      
+      # Executor e Celery
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__CELERY__BROKER_URL=redis://:${SERVICE_PASSWORD_REDIS}@redis:6379/0
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      
+      # Internal API
+      - AIRFLOW__CORE__INTERNAL_API_URL=http://api-server:8080
+      - AIRFLOW__CORE__INTERNAL_API_SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      - AIRFLOW__CORE__EXECUTION_API_SERVER_URL=http://api-server:8080/execution/
+      
+      # Segurança
+      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY}
+      - AIRFLOW__API__SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      - AIRFLOW__API_AUTH__JWT_SECRET=${SERVICE_PASSWORD_JWTAIRFLOW}
+      
+      # DAG Processor
+      - AIRFLOW__SCHEDULER__STANDALONE_DAG_PROCESSOR=true
+      
+      # DBT e OpenLineage
+      - DBT_EXECUTABLE_PATH=/opt/airflow/dbt_venv/bin/dbt
+      - AIRFLOW__OPENLINEAGE__NAMESPACE=airflow_dbt
+      - AIRFLOW__OPENLINEAGE__DISABLED=false
+      - AIRFLOW__OPENLINEAGE__TRANSPORT={"type":"console"}
+      - AIRFLOW__COSMOS__EMIT_LINEAGE=true
+    volumes:
+      - './dags:/opt/airflow/dags'
+      - './logs:/opt/airflow/logs'
+      - './plugins:/opt/airflow/plugins'
+      - './include:/opt/airflow/include'
+      - 'airflow_home:/opt/airflow'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    user: "50000:0"
+
+  # DAG Processor
+  dag-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile              
+    command: dag-processor
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Configurações básicas
+      - AIRFLOW_HOME=/opt/airflow
+      - AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      
+      # Banco de dados
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      
+      # FAB Auth Manager
+      - AIRFLOW__CORE__AUTH_MANAGER=airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+      
+      # Executor e Celery
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__CELERY__BROKER_URL=redis://:${SERVICE_PASSWORD_REDIS}@redis:6379/0
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-airflow}
+      
+      # Internal API
+      - AIRFLOW__CORE__INTERNAL_API_URL=http://api-server:8080
+      - AIRFLOW__CORE__INTERNAL_API_SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      - AIRFLOW__CORE__EXECUTION_API_SERVER_URL=http://api-server:8080/execution/
+      
+      # Segurança
+      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY}
+      - AIRFLOW__API__SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${SERVICE_PASSWORD_SECRETAIRFLOW}
+      - AIRFLOW__API_AUTH__JWT_SECRET=${SERVICE_PASSWORD_JWTAIRFLOW}
+      
+      # DAG Processor específico
+      - AIRFLOW__SCHEDULER__STANDALONE_DAG_PROCESSOR=true
+      
+      # DBT e OpenLineage
+      - DBT_EXECUTABLE_PATH=/opt/airflow/dbt_venv/bin/dbt
+      - AIRFLOW__OPENLINEAGE__NAMESPACE=airflow_dbt
+      - AIRFLOW__OPENLINEAGE__DISABLED=false
+      - AIRFLOW__OPENLINEAGE__TRANSPORT={"type":"console"}
+      - AIRFLOW__COSMOS__EMIT_LINEAGE=true
+    volumes:
+      - './dags:/opt/airflow/dags'
+      - './logs:/opt/airflow/logs'
+      - './plugins:/opt/airflow/plugins'
+      - './include:/opt/airflow/include'
+      - 'airflow_home:/opt/airflow'
+    restart: unless-stopped
+    user: "50000:0"
+
+volumes:
+  postgres_data:
+  redis_data:
+  airflow_home:

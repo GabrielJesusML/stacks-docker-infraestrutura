@@ -1,0 +1,71 @@
+# ============================================
+# Flask AppBuilder Auth Manager - ESSENCIAL PARA AUTENTICAÇÃO
+# ============================================
+apache-airflow-providers-fab
+flask-session<0.6
+flask-sqlalchemy
+
+# ============================================
+# Providers Celery - VERSÃO COMPATÍVEL COM AIRFLOW 3.0
+# ============================================
+apache-airflow-providers-celery
+celery
+redis
+kombu
+vine
+amqp
+flower
+
+# ============================================
+# Correções de compatibilidade SSH/SFTP
+# ============================================
+paramiko
+apache-airflow-providers-ssh
+apache-airflow-providers-sftp
+
+# ============================================
+# Astronomer Cosmos para integração com DBT
+# ============================================
+astronomer-cosmos
+
+# ============================================
+# OpenLineage
+# ============================================
+apache-airflow-providers-openlineage
+
+# ============================================
+# DLT para pipelines de ingestão
+# ============================================
+dlt
+dlt[postgres]>=1.15.0
+
+# ============================================
+# Airflow Code Editor - Editor Web Integrado
+# ============================================
+airflow-code-editor
+black                     # Formatador de código Python
+isort                     # Organizador de imports Python
+
+# ============================================
+# Dependências opcionais do Code Editor
+# ============================================
+# Descomente se quiser suporte a filesystems remotos
+fs-s3fs                 
+
+# ============================================
+# Providers essenciais do Airflow
+# ============================================
+apache-airflow-providers-common-sql
+apache-airflow-providers-postgres
+apache-airflow-providers-http
+apache-airflow-providers-docker
+
+# ============================================
+# Dependências adicionais
+# ============================================
+sqlalchemy
+psycopg2-binary
+werkzeug
+requests
+pandas
+pyarrow
