@@ -58,9 +58,31 @@ node.id=${KAFKA_BROKER_ID:-1}
 # Listeners
 listeners=${KAFKA_LISTENERS}
 advertised.listeners=${KAFKA_ADVERTISED_LISTENERS}
-listener.security.protocol.map=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
-inter.broker.listener.name=PLAINTEXT
-controller.listener.names=CONTROLLER
+listener.security.protocol.map=${KAFKA_LISTENER_SECURITY_PROTOCOL_MAP:-PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT}
+inter.broker.listener.name=${KAFKA_INTER_BROKER_LISTENER_NAME:-PLAINTEXT}
+controller.listener.names=${KAFKA_CONTROLLER_LISTENER_NAMES:-CONTROLLER}
+
+# SASL Configuration
+sasl.enabled.mechanisms=${KAFKA_SASL_ENABLED_MECHANISMS:-PLAIN}
+sasl.mechanism.inter.broker.protocol=${KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL:-PLAIN}
+CONF
+
+# Adicionar JAAS config se SASL estiver habilitado
+if [ -n "\$KAFKA_LISTENER_NAME_BROKER_SCRAM_SHA_256_SASL_JAAS_CONFIG" ]; then
+    echo "listener.name.broker.scram-sha-256.sasl.jaas.config=\${KAFKA_LISTENER_NAME_BROKER_SCRAM_SHA_256_SASL_JAAS_CONFIG}" >> \${KAFKA_HOME}/config/kraft-server.properties
+fi
+
+# Adicionar ACL config se definido
+if [ -n "\$KAFKA_AUTHORIZER_CLASS_NAME" ]; then
+    cat >> \${KAFKA_HOME}/config/kraft-server.properties << ACL_CONF
+authorizer.class.name=\${KAFKA_AUTHORIZER_CLASS_NAME}
+allow.everyone.if.no.acl.found=\${KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND:-false}
+super.users=\${KAFKA_SUPER_USERS:-User:admin}
+ACL_CONF
+fi
+
+# Continuar com o resto da configuração
+cat >> \${KAFKA_HOME}/config/kraft-server.properties << CONF
 
 # Log Configuration
 log.dirs=${KAFKA_DATA_DIR}
