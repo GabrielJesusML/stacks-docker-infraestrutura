@@ -6,27 +6,30 @@ services:
     hostname: kafka
     ports:
       - "9092:9092"
+      - "9094:9094"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
       
-      # Listeners com SASL (usando nome customizado BROKER)
-      KAFKA_LISTENERS: "BROKER://:9092,CONTROLLER://:9093"
-      KAFKA_ADVERTISED_LISTENERS: "BROKER://kafka:9092"
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "BROKER:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT"
+      # Listeners: BROKER (interno), EXTERNAL (externo), CONTROLLER (kraft)
+      KAFKA_LISTENERS: "BROKER://:9092,EXTERNAL://:9094,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "BROKER://kafka:9092,EXTERNAL://${KAFKA_EXTERNAL_HOST:-localhost}:9094"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "BROKER:SASL_PLAINTEXT,EXTERNAL:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
       KAFKA_INTER_BROKER_LISTENER_NAME: "BROKER"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
       
-      # SASL Configuration
+      # SASL Configuration (para BROKER e EXTERNAL)
       KAFKA_SASL_ENABLED_MECHANISMS: "SCRAM-SHA-256"
       KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: "SCRAM-SHA-256"
-      KAFKA_LISTENER_NAME_BROKER_SCRAM_SHA_256_SASL_JAAS_CONFIG: 'org.apache.kafka.common.security.scram.ScramLoginModule required username="admin" password="admin-secret";'
+      KAFKA_LISTENER_NAME_BROKER_SCRAM_SHA_256_SASL_JAAS_CONFIG: 'org.apache.kafka.common.security.scram.ScramLoginModule required username="${SERVICE_USER_KAFKA}" password="${SERVICE_PASSWORD_KAFKA}";'
+      KAFKA_LISTENER_NAME_EXTERNAL_SCRAM_SHA_256_SASL_JAAS_CONFIG: 'org.apache.kafka.common.security.scram.ScramLoginModule required username="${SERVICE_USER_KAFKA}" password="${SERVICE_PASSWORD_KAFKA}";'
+      KAFKA_SCRAM_USERS: "${SERVICE_USER_KAFKA}:${SERVICE_PASSWORD_KAFKA}"
       
       # ACLs Configuration
       KAFKA_AUTHORIZER_CLASS_NAME: "org.apache.kafka.metadata.authorizer.StandardAuthorizer"
       KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "false"
-      KAFKA_SUPER_USERS: "User:admin"
+      KAFKA_SUPER_USERS: "User:${SERVICE_USER_KAFKA};User:ANONYMOUS"
       
       # Replication & Partitions
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -41,7 +44,7 @@ services:
       - /mnt/HC_Volume_104350228/kafka_data/scripts:/opt/kafka-scripts
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      test: ["CMD-SHELL", "kafka-metadata.sh --snapshot /var/lib/kafka/data/__cluster_metadata-0/00000000000000000000.log --command-config /dev/null 2>/dev/null || exit 0"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -61,7 +64,7 @@ services:
       # Autenticação SASL para conectar no Kafka
       KAFKA_CLUSTERS_0_PROPERTIES_SECURITY_PROTOCOL: SASL_PLAINTEXT
       KAFKA_CLUSTERS_0_PROPERTIES_SASL_MECHANISM: SCRAM-SHA-256
-      KAFKA_CLUSTERS_0_PROPERTIES_SASL_JAAS_CONFIG: 'org.apache.kafka.common.security.scram.ScramLoginModule required username="admin" password="admin-secret";'
+      KAFKA_CLUSTERS_0_PROPERTIES_SASL_JAAS_CONFIG: 'org.apache.kafka.common.security.scram.ScramLoginModule required username="${SERVICE_USER_KAFKA}" password="${SERVICE_PASSWORD_KAFKA}";'
       
       # Autenticação do Kafka UI
       AUTH_TYPE: "LOGIN_FORM"
