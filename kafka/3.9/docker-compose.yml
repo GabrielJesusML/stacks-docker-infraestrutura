@@ -7,9 +7,16 @@ services:
     ports:
       - "9092:9092"
       - "9094:9094"
+    volumes:
+      - /mnt/HC_Volume_104350228/kafka_data/data:/var/lib/kafka/data
+      - ./kafka-scripts:/opt/kafka-scripts
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      
+      # Credenciais admin para scripts
+      KAFKA_ADMIN_USER: ${SERVICE_USER_KAFKA}
+      KAFKA_ADMIN_PASSWORD: ${SERVICE_PASSWORD_KAFKA}
       
       # Listeners: BROKER (interno), EXTERNAL (externo), CONTROLLER (kraft)
       KAFKA_LISTENERS: "BROKER://:9092,EXTERNAL://:9094,CONTROLLER://:9093"
@@ -41,7 +48,6 @@ services:
       KAFKA_LOG_RETENTION_HOURS: 168
     volumes:
       - /mnt/HC_Volume_104350228/kafka_data/data:/var/lib/kafka/data
-      - /mnt/HC_Volume_104350228/kafka_data/scripts:/opt/kafka-scripts
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "kafka-metadata.sh --snapshot /var/lib/kafka/data/__cluster_metadata-0/00000000000000000000.log --command-config /dev/null 2>/dev/null || exit 0"]
